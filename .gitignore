@@ -1,0 +1,38 @@
+# Data
+data/raw/*.csv
+data/raw/*.zip
+
+# Outputs (submissions and models - too large for git)
+outputs/submissions/*.csv
+outputs/r*_models/
+catboost_info/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Large files
+*.pkl
+*.joblib
+*.h5
+*.parquet
+
+# Logs
+/tmp/

@@ -1,0 +1,619 @@
+"""Round 11: Iterative Pseudo-Labeling + Hill Climbing Ensemble
+
+Key innovations:
+1. TWO rounds of pseudo-labeling (re-label test with Round 1 models)
+2. Hill Climbing ensemble (greedy forward selection) instead of random weight search
+3. Based on R09's 10-model setup
+
+Pipeline:
+1. Load data + pairwise TE + TE_ORIG (same as R09)
+2. Stage 1: Train 10 models (3 XGB + 6 LGB + 1 CB)
+3. Pseudo-label Round 1: average all models, threshold=0.90
+4. Stage 2: Retrain 10 models with pseudo data
+5. Pseudo-label Round 2: average Stage 2 models, threshold=0.95 (higher confidence)
+6. Stage 3: Retrain 10 models with both pseudo rounds
+7. Hill Climbing ensemble (greedy forward model selection)
+8. Threshold optimization
+"""
+import warnings
+warnings.filterwarnings("ignore")
+import time
+import gc
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+import xgboost as xgb
+from pathlib import Path
+import sys
+from itertools import combinations
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import balanced_accuracy_score
+from sklearn.preprocessing import TargetEncoder
+from sklearn.utils.class_weight import compute_class_weight, compute_sample_weight
+from sklearn.linear_model import LogisticRegression
+from scipy.optimize import minimize
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from src.config import (SUBMISSIONS, TARGET_COL, ID_COL, CLASSES,
+                        CATEGORICAL_COLS, NUMERICAL_COLS)
+
+def log(msg=""):
+    print(msg, flush=True)
+
+start = time.time()
+log("=" * 60)
+log("Round 11: Iterative Pseudo-Labeling + Hill Climbing")
+log("=" * 60)
+
+# ============================================================
+# STEP 1: Load data
+# ============================================================
+log("\nSTEP 1: Load data")
+DATA = Path(__file__).resolve().parent.parent / "data" / "raw"
+train = pd.read_csv(DATA / "train.csv", index_col="id")
+test = pd.read_csv(DATA / "test.csv", index_col="id")
+orig = pd.read_csv(DATA / "irrigation_prediction.csv")
+test_ids = pd.read_csv(DATA / "test.csv")[ID_COL].values
+
+TARGET = TARGET_COL
+tmap = {"Low": 0, "Medium": 1, "High": 2}
+rmap = {0: "Low", 1: "Medium", 2: "High"}
+train[TARGET] = train[TARGET].map(tmap)
+orig[TARGET] = orig[TARGET].map(tmap)
+log(f"  Train: {train.shape}, Test: {test.shape}, Orig: {orig.shape}")
+
+NUMS = NUMERICAL_COLS
+CATS = CATEGORICAL_COLS
+NF = 5
+SEEDS = [42, 123, 456]
+
+# ============================================================
+# STEP 2: Factorize categoricals
+# ============================================================
+log("\nSTEP 2: Factorizing categoricals...")
+combined = pd.concat([train, test, orig])
+for c in CATS:
+    combined[c], _ = combined[c].factorize()
+combined[CATS] = combined[CATS].astype("category")
+train = combined[:len(train)].copy()
+test = combined[len(train):len(train)+len(test)].copy().drop(TARGET, axis=1)
+orig = combined[len(train)+len(test):].copy()
+del combined
+gc.collect()
+
+# ============================================================
+# STEP 3: Pairwise TE features
+# ============================================================
+log("\nSTEP 3: Creating pairwise interaction features...")
+TE_columns = []
+columns = NUMS + list(CATS)
+total_pairs = len(list(combinations(columns, 2)))
+
+for cols in combinations(columns, 2):
+    name = "-".join(cols)
+    train[name] = train[cols[0]].astype(str)
+    for col in cols[1:]:
+        train[name] = train[name] + "_" + train[col].astype(str)
+    test[name] = test[cols[0]].astype(str)
+    for col in cols[1:]:
+        test[name] = test[name] + "_" + test[col].astype(str)
+    orig[name] = orig[cols[0]].astype(str)
+    for col in cols[1:]:
+        orig[name] = orig[name] + "_" + orig[col].astype(str)
+
+    cv = pd.concat([train[name], test[name], orig[name]], ignore_index=True)
+    cv, _ = cv.factorize()
+    if pd.Series(cv).nunique() > len(cv) // 2:
+        train.drop(name, axis=1, inplace=True)
+        test.drop(name, axis=1, inplace=True)
+        orig.drop(name, axis=1, inplace=True)
+        continue
+    train[name] = cv[:len(train)]
+    test[name] = cv[len(train):len(train)+len(test)]
+    orig[name] = cv[len(train)+len(test):]
+    TE_columns.append(name)
+
+log(f"  Created {len(TE_columns)} pairwise TE features (from {total_pairs} total pairs)")
+
+# ============================================================
+# STEP 4: TE_ORIG features
+# ============================================================
+log("\nSTEP 4: Computing TE_ORIG features...")
+for c in CATS + NUMS:
+    tmp = orig.groupby(c, observed=True)[TARGET].mean().astype("float32")
+    tmp.name = f"TE_ORIG_{c}"
+    train = train.merge(tmp, on=c, how="left")
+    train[tmp.name] = train[tmp.name].fillna(0.5)
+    test = test.merge(tmp, on=c, how="left")
+    test[tmp.name] = test[tmp.name].fillna(0.5)
+
+FEATURES = [c for c in train.columns if c != TARGET]
+log(f"  Total features before TE: {len(FEATURES)}")
+
+# ============================================================
+# Helper functions
+# ============================================================
+def apply_te(X_tr, X_va, X_te, te_cols, y_tr):
+    enc = TargetEncoder(target_type="multiclass", cv=5, random_state=42)
+    tr_enc = enc.fit_transform(X_tr[te_cols], y_tr)
+    va_enc = enc.transform(X_va[te_cols])
+    te_enc = enc.transform(X_te[te_cols])
+    n_enc = tr_enc.shape[1]
+    col_names = [f"TE_{i}" for i in range(n_enc)]
+    X_tr = pd.concat([X_tr.drop(columns=te_cols).reset_index(drop=True),
+                       pd.DataFrame(tr_enc, columns=col_names)], axis=1)
+    X_va = pd.concat([X_va.drop(columns=te_cols).reset_index(drop=True),
+                       pd.DataFrame(va_enc, columns=col_names)], axis=1)
+    X_te = pd.concat([X_te.drop(columns=te_cols).reset_index(drop=True),
+                       pd.DataFrame(te_enc, columns=col_names)], axis=1)
+    return X_tr, X_va, X_te
+
+def make_bal_acc():
+    def f(y_true, y_pred):
+        return balanced_accuracy_score(y_true.astype(int), np.argmax(y_pred.reshape(-1, 3), axis=1))
+    f.__name__ = "bal_ACC"
+    return f
+
+def train_xgb(train_df, y_arr, test_df, te_cols, seed, nm, n_orig=None, pw=None):
+    skf = StratifiedKFold(n_splits=NF, shuffle=True, random_state=seed)
+    oof_size = n_orig if n_orig is not None else len(train_df)
+    oof = np.zeros((oof_size, 3))
+    tp = np.zeros((len(test_df), 3))
+
+    for fold, (tri, vai) in enumerate(skf.split(train_df, y_arr)):
+        orig_vai = vai[vai < n_orig] if n_orig is not None else vai
+        if len(orig_vai) == 0:
+            continue
+
+        X_tr = train_df.iloc[tri].copy()
+        X_va = train_df.iloc[orig_vai].copy()
+        X_te = test_df.copy()
+        y_tr = y_arr[tri]
+        X_tr, X_va, X_te = apply_te(X_tr, X_va, X_te, te_cols, y_tr)
+
+        classes = np.unique(y_tr)
+        cw = dict(zip(classes, compute_class_weight("balanced", classes=classes, y=y_tr)))
+        sw_class = np.array([cw[l] for l in y_tr])
+        if pw is not None and n_orig is not None:
+            sw_sample = np.ones(len(tri))
+            sw_sample[tri >= n_orig] = pw
+            sw = sw_class * sw_sample
+        else:
+            sw = sw_class
+
+        feat = [c for c in X_tr.columns if c != TARGET]
+        for c in CATS:
+            for df_ in [X_tr, X_va, X_te]:
+                df_[c] = df_[c].astype(int)
+
+        model = xgb.XGBClassifier(
+            max_depth=6, subsample=0.8, colsample_bytree=0.8,
+            n_estimators=5000, objective="multi:softprob", learning_rate=0.03,
+            callbacks=[xgb.callback.EarlyStopping(rounds=100, metric_name="bal_ACC",
+                                                   maximize=True, save_best=True)],
+            eval_metric=make_bal_acc(),
+            max_bin=1024, random_state=seed, n_jobs=-1, tree_method="hist"
+        )
+        model.fit(X_tr[feat], y_tr, eval_set=[(X_va[feat], y_arr[orig_vai])],
+                  sample_weight=sw, verbose=False)
+        oof[orig_vai] = model.predict_proba(X_va[feat])
+        tp += model.predict_proba(X_te[feat]) / NF
+
+        fs = balanced_accuracy_score(y_arr[orig_vai], oof[orig_vai].argmax(1))
+        log(f"    {nm} fold {fold+1}: {fs:.5f}")
+        del X_tr, X_va, X_te, model
+        gc.collect()
+
+    sc = balanced_accuracy_score(y_arr[:oof_size], oof.argmax(1))
+    log(f"  >> {nm}: {sc:.5f}")
+    return oof, tp
+
+def train_lgb(train_df, y_arr, test_df, te_cols, seed, nm, lgb_params, n_orig=None, pw=None):
+    skf = StratifiedKFold(n_splits=NF, shuffle=True, random_state=seed)
+    oof_size = n_orig if n_orig is not None else len(train_df)
+    oof = np.zeros((oof_size, 3))
+    tp = np.zeros((len(test_df), 3))
+
+    for fold, (tri, vai) in enumerate(skf.split(train_df, y_arr)):
+        orig_vai = vai[vai < n_orig] if n_orig is not None else vai
+        if len(orig_vai) == 0:
+            continue
+
+        X_tr = train_df.iloc[tri].copy()
+        X_va = train_df.iloc[orig_vai].copy()
+        X_te = test_df.copy()
+        y_tr = y_arr[tri]
+        X_tr, X_va, X_te = apply_te(X_tr, X_va, X_te, te_cols, y_tr)
+
+        if pw is not None and n_orig is not None:
+            sw_balanced = compute_sample_weight("balanced", y_tr)
+            sw_sample = np.ones(len(tri))
+            sw_sample[tri >= n_orig] = pw
+            sw = sw_balanced * sw_sample
+        else:
+            sw = compute_sample_weight("balanced", y_tr)
+
+        feat = [c for c in X_tr.columns if c != TARGET]
+        for c in CATS:
+            for df_ in [X_tr, X_va, X_te]:
+                df_[c] = df_[c].astype("category")
+
+        model = lgb.LGBMClassifier(**lgb_params, random_state=seed)
+        model.fit(X_tr[feat], y_tr, sample_weight=sw,
+                  eval_set=[(X_va[feat], y_arr[orig_vai])],
+                  callbacks=[lgb.early_stopping(50, verbose=False)])
+        oof[orig_vai] = model.predict_proba(X_va[feat])
+        tp += model.predict_proba(X_te[feat]) / NF
+        del X_tr, X_va, X_te, model
+        gc.collect()
+
+    sc = balanced_accuracy_score(y_arr[:oof_size], oof.argmax(1))
+    log(f"  >> {nm}: {sc:.5f}")
+    return oof, tp
+
+def train_cb(train_df, y_arr, test_df, te_cols, seed, nm, n_orig=None, pw=None):
+    import catboost as cb_mod
+    skf = StratifiedKFold(n_splits=NF, shuffle=True, random_state=seed)
+    oof_size = n_orig if n_orig is not None else len(train_df)
+    oof = np.zeros((oof_size, 3))
+    tp = np.zeros((len(test_df), 3))
+
+    for fold, (tri, vai) in enumerate(skf.split(train_df, y_arr)):
+        orig_vai = vai[vai < n_orig] if n_orig is not None else vai
+        if len(orig_vai) == 0:
+            continue
+
+        X_tr = train_df.iloc[tri].copy()
+        X_va = train_df.iloc[orig_vai].copy()
+        X_te = test_df.copy()
+        y_tr = y_arr[tri]
+        X_tr, X_va, X_te = apply_te(X_tr, X_va, X_te, te_cols, y_tr)
+
+        classes = np.unique(y_tr)
+        cw = dict(zip(classes, compute_class_weight("balanced", classes=classes, y=y_tr)))
+        sw_class = np.array([cw[l] for l in y_tr])
+        if pw is not None and n_orig is not None:
+            sw_sample = np.ones(len(tri))
+            sw_sample[tri >= n_orig] = pw
+            sw = sw_class * sw_sample
+        else:
+            sw = sw_class
+
+        feat = [c for c in X_tr.columns if c != TARGET]
+        for c in CATS:
+            for df_ in [X_tr, X_va, X_te]:
+                df_[c] = df_[c].astype(str).astype("category")
+
+        model = cb_mod.CatBoostClassifier(
+            task_type="CPU", iterations=800, learning_rate=0.05, depth=6,
+            auto_class_weights="Balanced", cat_features=CATS, verbose=0,
+            colsample_bylevel=0.8, l2_leaf_reg=3.0, min_data_in_leaf=50,
+            random_seed=seed
+        )
+        model.fit(X_tr[feat], y_tr, sample_weight=sw,
+                  eval_set=(X_va[feat], y_arr[orig_vai]), early_stopping_rounds=50)
+        oof[orig_vai] = model.predict_proba(X_va[feat])
+        tp += model.predict_proba(X_te[feat]) / NF
+
+        fs = balanced_accuracy_score(y_arr[orig_vai], oof[orig_vai].argmax(1))
+        log(f"    {nm} fold {fold+1}: {fs:.5f}")
+        del X_tr, X_va, X_te, model
+        gc.collect()
+
+    sc = balanced_accuracy_score(y_arr[:oof_size], oof.argmax(1))
+    log(f"  >> {nm}: {sc:.5f}")
+    return oof, tp
+
+def do_pseudo_label(all_tp, test_df, y_arr, threshold, rmap, stage_label):
+    """Generate pseudo-labels from test predictions."""
+    avg_tp = sum(all_tp.values()) / len(all_tp)
+    pred_labels = avg_tp.argmax(axis=1)
+    pred_conf = avg_tp.max(axis=1)
+
+    pseudo_mask = pred_conf >= threshold
+    log(f"  {stage_label} — Total test: {len(test_df)}, Pseudo-labeled: {pseudo_mask.sum()} ({pseudo_mask.mean()*100:.1f}%)")
+
+    pseudo_labels = pred_labels[pseudo_mask]
+    for cls_id, cls_name in rmap.items():
+        log(f"    {cls_name}: {(pseudo_labels == cls_id).sum()}")
+
+    pseudo_test = test_df[pseudo_mask].copy()
+    pseudo_test[TARGET] = pseudo_labels
+    return pseudo_test, pseudo_labels, pseudo_mask
+
+def train_all_models(train_df, y_arr, test_df, te_cols, stage_prefix, n_orig=None, pw=None):
+    """Train all 10 models for a given stage."""
+    models_oof = {}
+    models_tp = {}
+    LGB_CONFIGS = [
+        dict(n_estimators=2000, learning_rate=0.02, num_leaves=127, max_depth=9,
+             class_weight="balanced", verbose=-1, colsample_bytree=0.7, subsample=0.8,
+             reg_alpha=0.05, reg_lambda=0.1, min_child_samples=50),
+        dict(n_estimators=1500, learning_rate=0.03, num_leaves=63, max_depth=7,
+             class_weight="balanced", verbose=-1, colsample_bytree=0.8, subsample=0.7,
+             reg_alpha=0.2, reg_lambda=0.3, min_child_samples=30),
+    ]
+
+    # XGBoost
+    log(f"  --- {stage_prefix} XGBoost ---")
+    for SEED in SEEDS:
+        nm = f"{stage_prefix}_xgb_s{SEED}"
+        oof, tp = train_xgb(train_df, y_arr, test_df, te_cols, SEED, nm, n_orig=n_orig, pw=pw)
+        models_oof[nm] = oof
+        models_tp[nm] = tp
+
+    # LightGBM
+    log(f"  --- {stage_prefix} LightGBM ---")
+    for SEED in SEEDS:
+        for li, lp in enumerate(LGB_CONFIGS):
+            nm = f"{stage_prefix}_lgb{li}_s{SEED}"
+            oof, tp = train_lgb(train_df, y_arr, test_df, te_cols, SEED, nm, lp, n_orig=n_orig, pw=pw)
+            models_oof[nm] = oof
+            models_tp[nm] = tp
+
+    # CatBoost
+    log(f"  --- {stage_prefix} CatBoost ---")
+    nm = f"{stage_prefix}_cb_s42"
+    oof, tp = train_cb(train_df, y_arr, test_df, te_cols, 42, nm, n_orig=n_orig, pw=pw)
+    models_oof[nm] = oof
+    models_tp[nm] = tp
+
+    return models_oof, models_tp
+
+# ============================================================
+# STEP 5: Stage 1 — Train 10 models (no pseudo)
+# ============================================================
+y = train[TARGET].values
+
+log("\nSTEP 5: Stage 1 — Train without pseudo labels...")
+s1_oof, s1_tp = train_all_models(train, y, test, TE_columns, "s1")
+log(f"  Stage 1 models: {len(s1_oof)}")
+
+# ============================================================
+# STEP 6: Pseudo-Labeling Round 1
+# ============================================================
+log("\nSTEP 6: Pseudo-Labeling Round 1 (threshold=0.90)...")
+pseudo1_test, pseudo1_labels, _ = do_pseudo_label(s1_tp, test, y, 0.90, rmap, "Round 1")
+
+# ============================================================
+# STEP 7: Stage 2 — Train with Round 1 pseudo labels
+# ============================================================
+log(f"\nSTEP 7: Stage 2 — Train with Round 1 pseudo labels...")
+train_s2 = pd.concat([train, pseudo1_test], ignore_index=True)
+y_s2 = np.concatenate([y, pseudo1_labels])
+log(f"  Train+Pseudo1: {len(train_s2)} rows")
+
+N_ORIG = len(train)
+PW = 0.5
+
+s2_oof, s2_tp = train_all_models(train_s2, y_s2, test, TE_columns, "s2", n_orig=N_ORIG, pw=PW)
+log(f"  Stage 2 models: {len(s2_oof)}")
+
+# ============================================================
+# STEP 8: Pseudo-Labeling Round 2 (higher threshold)
+# ============================================================
+log("\nSTEP 8: Pseudo-Labeling Round 2 (threshold=0.95)...")
+# Use Stage 2 predictions for Round 2 — higher confidence threshold
+pseudo2_test, pseudo2_labels, _ = do_pseudo_label(s2_tp, test, y, 0.95, rmap, "Round 2")
+
+# ============================================================
+# STEP 9: Stage 3 — Train with BOTH pseudo label rounds
+# ============================================================
+log(f"\nSTEP 9: Stage 3 — Train with both pseudo rounds...")
+# Combine original + Round 1 pseudo + Round 2 pseudo
+# Avoid duplicates: Round 2 may overlap with Round 1
+pseudo1_ids = set(pseudo1_test.index)
+# pseudo2 that are NOT in pseudo1 (new high-confidence ones)
+pseudo2_new_mask = ~pseudo2_test.index.isin(pseudo1_ids)
+pseudo2_new = pseudo2_test[pseudo2_new_mask]
+pseudo2_new_labels = pseudo2_labels[pseudo2_new_mask.values]
+
+train_s3 = pd.concat([train, pseudo1_test, pseudo2_new], ignore_index=True)
+y_s3 = np.concatenate([y, pseudo1_labels, pseudo2_new_labels])
+log(f"  Train+Pseudo1+Pseudo2: {len(train_s3)} rows (P1: {len(pseudo1_test)}, P2 new: {len(pseudo2_new)})")
+
+s3_oof, s3_tp = train_all_models(train_s3, y_s3, test, TE_columns, "s3", n_orig=N_ORIG, pw=PW)
+log(f"  Stage 3 models: {len(s3_oof)}")
+
+# ============================================================
+# STEP 10: Hill Climbing Ensemble
+# ============================================================
+# Combine ALL models from ALL stages for maximum diversity
+all_oof = {}
+all_tp = {}
+for prefix, (oofs, tps) in [("s1", (s1_oof, s1_tp)),
+                              ("s2", (s2_oof, s2_tp)),
+                              ("s3", (s3_oof, s3_tp))]:
+    for nm in oofs:
+        all_oof[f"{nm}"] = oofs[nm]
+        all_tp[f"{nm}"] = tps[nm]
+
+log(f"\nSTEP 10: Hill Climbing Ensemble ({len(all_oof)} models from 3 stages)...")
+names = list(all_oof.keys())
+
+# Individual scores
+for n in names:
+    s = balanced_accuracy_score(y, all_oof[n].argmax(1))
+    log(f"    {n}: {s:.5f}")
+
+def hill_climbing(y_true, oof_dict, model_names, n_repeats=5):
+    """Greedy forward selection: start with best model, add models that improve score."""
+    # Score each individual model
+    scores = {}
+    for nm in model_names:
+        scores[nm] = balanced_accuracy_score(y_true, oof_dict[nm].argmax(1))
+
+    # Sort by score descending
+    ranked = sorted(scores.items(), key=lambda x: -x[1])
+    log(f"  Hill Climbing: best individual = {ranked[0][0]} ({ranked[0][1]:.5f})")
+
+    # Start with the best model
+    selected = [ranked[0][0]]
+    current_pred = oof_dict[ranked[0][0]].copy()
+    current_score = ranked[0][1]
+    best_overall_score = current_score
+
+    remaining = [nm for nm, _ in ranked[1:]]
+
+    improved = True
+    while improved and remaining:
+        improved = False
+        best_addition = None
+        best_add_score = current_score
+        best_add_weight = None
+
+        for nm in remaining:
+            # Try adding this model with various weights
+            for w_new in np.arange(0.05, 0.55, 0.05):
+                w_old = 1.0 - w_new
+                trial_pred = w_old * current_pred + w_new * oof_dict[nm]
+                trial_score = balanced_accuracy_score(y_true, trial_pred.argmax(1))
+                if trial_score > best_add_score:
+                    best_add_score = trial_score
+                    best_addition = nm
+                    best_add_weight = w_new
+
+        if best_addition is not None:
+            w_old = 1.0 - best_add_weight
+            current_pred = w_old * current_pred + best_add_weight * oof_dict[best_addition]
+            current_score = best_add_score
+            selected.append(best_addition)
+            remaining.remove(best_addition)
+            improved = True
+            log(f"    + {best_addition} (w={best_add_weight:.2f}) → {current_score:.5f}")
+
+    log(f"  Hill Climbing selected {len(selected)} models, score: {current_score:.5f}")
+    return selected, current_score
+
+# Run hill climbing on OOF predictions
+hc_selected, hc_score = hill_climbing(y, all_oof, names)
+
+# Build hill climbing test predictions with same weights
+# Re-run hill climbing to get weights (simplified: equal weight for selected)
+hc_oof = sum(all_oof[nm] for nm in hc_selected) / len(hc_selected)
+hc_tp = sum(all_tp[nm] for nm in hc_selected) / len(hc_selected)
+
+# Also run weighted avg for comparison
+bwa, bww = 0, None
+rng = np.random.RandomState(42)
+for _ in range(2000):
+    w = rng.dirichlet(np.ones(len(names)))
+    combo = sum(w[j] * all_oof[n] for j, n in enumerate(names))
+    s = balanced_accuracy_score(y, combo.argmax(1))
+    if s > bwa:
+        bwa = s
+        bww = w.copy()
+log(f"  Weighted avg OOF: {bwa:.5f}")
+
+# LR Stacking
+log("  Running LR stacking...")
+ostk = np.hstack([all_oof[n] for n in names])
+tstk = np.hstack([all_tp[n] for n in names])
+
+skf = StratifiedKFold(n_splits=NF, shuffle=True, random_state=42)
+moof = np.zeros(len(y), dtype=int)
+mtest = np.zeros((len(test), 3))
+for fold, (tri, vai) in enumerate(skf.split(ostk, y)):
+    lr = LogisticRegression(class_weight="balanced", max_iter=2000, C=1.0, random_state=42)
+    lr.fit(ostk[tri], y[tri])
+    moof[vai] = lr.predict(ostk[vai])
+    mtest += lr.predict_proba(tstk) / NF
+ssc = balanced_accuracy_score(y, moof)
+log(f"  Stacked OOF: {ssc:.5f}")
+
+# Choose best ensemble method
+best_method = max([
+    ("hill_climbing", hc_score),
+    ("weighted_avg", bwa),
+    ("stacking", ssc)
+], key=lambda x: x[1])
+log(f"  >>> Best ensemble: {best_method[0]} ({best_method[1]:.5f})")
+
+if best_method[0] == "stacking":
+    fm = LogisticRegression(class_weight="balanced", max_iter=2000, C=1.0, random_state=42)
+    fm.fit(ostk, y)
+    bt = fm.predict_proba(tstk)
+    bo = np.zeros((len(y), 3))
+    for fold, (tri, vai) in enumerate(skf.split(ostk, y)):
+        lr = LogisticRegression(class_weight="balanced", max_iter=2000, C=1.0, random_state=42)
+        lr.fit(ostk[tri], y[tri])
+        bo[vai] = lr.predict_proba(ostk[vai])
+elif best_method[0] == "weighted_avg":
+    bt = sum(bww[j] * all_tp[n] for j, n in enumerate(names))
+    bo = sum(bww[j] * all_oof[n] for j, n in enumerate(names))
+else:
+    bt = hc_tp
+    bo = hc_oof
+
+# ============================================================
+# STEP 11: Threshold Optimization
+# ============================================================
+log("\nSTEP 11: Threshold optimization...")
+
+def neg_ba(w):
+    return -balanced_accuracy_score(y, (bo * np.array([1.0, w[0], w[1]])).argmax(1))
+
+bg = (1.0, 1.0)
+bgs = -1
+for wm in np.arange(0.3, 2.0, 0.05):
+    for wh in np.arange(0.3, 8.0, 0.1):
+        s = -neg_ba([wm, wh])
+        if s > bgs:
+            bgs = s
+            bg = (wm, wh)
+
+res = minimize(neg_ba, list(bg), method="Nelder-Mead", options={"xatol": 0.001, "fatol": 1e-6, "maxiter": 1000})
+bw = [1.0, res.x[0], res.x[1]]
+fcv = -res.fun
+log(f"  Weights: Low={bw[0]:.3f} Med={bw[1]:.3f} High={bw[2]:.3f}")
+log(f"  FINAL CV: {fcv:.5f}")
+
+# ============================================================
+# STEP 12: Save submissions
+# ============================================================
+log("\nSTEP 12: Save submissions...")
+
+preds_thresh = (bt * np.array(bw)).argmax(1)
+sub = pd.DataFrame({ID_COL: test_ids, TARGET_COL: [rmap[p] for p in preds_thresh]})
+sub.to_csv(SUBMISSIONS / "submission_r11_thresh_opt.csv", index=False)
+dist = pd.Series([rmap[p] for p in preds_thresh]).value_counts()
+log(f"  r11_thresh_opt: {dict(dist)}")
+
+preds_default = bt.argmax(1)
+sub2 = pd.DataFrame({ID_COL: test_ids, TARGET_COL: [rmap[p] for p in preds_default]})
+sub2.to_csv(SUBMISSIONS / "submission_r11_ens_default.csv", index=False)
+dist2 = pd.Series([rmap[p] for p in preds_default]).value_counts()
+log(f"  r11_ens_default: {dict(dist2)}")
+
+# Also save best single stage for comparison
+s3_names = list(s3_oof.keys())
+s3_bwa, s3_bww = 0, None
+for _ in range(2000):
+    w = rng.dirichlet(np.ones(len(s3_names)))
+    combo = sum(w[j] * s3_oof[n] for j, n in enumerate(s3_names))
+    s = balanced_accuracy_score(y, combo.argmax(1))
+    if s > s3_bwa:
+        s3_bwa = s
+        s3_bww = w.copy()
+s3_bt = sum(s3_bww[j] * s3_tp[n] for j, n in enumerate(s3_names))
+preds_s3 = s3_bt.argmax(1)
+sub3 = pd.DataFrame({ID_COL: test_ids, TARGET_COL: [rmap[p] for p in preds_s3]})
+sub3.to_csv(SUBMISSIONS / "submission_r11_stage3_only.csv", index=False)
+
+elapsed = int(time.time() - start)
+
+# ============================================================
+# SUMMARY
+# ============================================================
+log("\n" + "=" * 60)
+log(f"SUMMARY - Round 11")
+log("=" * 60)
+log(f"  Pseudo Round 1 (thresh=0.90): {len(pseudo1_test)} samples")
+log(f"  Pseudo Round 2 (thresh=0.95): {len(pseudo2_new)} new samples")
+log(f"  Stage 3 train size: {len(train_s3)}")
+log(f"  Total models across stages: {len(all_oof)}")
+log(f"  Hill Climbing: {hc_score:.5f} ({len(hc_selected)} models)")
+log(f"  Weighted avg: {bwa:.5f}")
+log(f"  Stacking: {ssc:.5f}")
+log(f"  FINAL CV: {fcv:.5f}")
+log(f"  Total: {elapsed}s")
