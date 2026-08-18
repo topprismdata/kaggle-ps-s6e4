@@ -53,26 +53,22 @@ number:
     integration;
 -   diverse signals can matter more than adding more similar models.
 
-These should become the first screen.
+These lessons are reported first on this page.
 
 ------------------------------------------------------------------------
 
 ## Experiment history
 
-Do not keep R01--R18 as the main README body.
-
-Move to:
-
-`docs/experiment-log.md`
-
-README should show:
+The full R01--R18 experiment log is preserved verbatim in
+[`docs/competition-log.md`](docs/competition-log.md) as project history.
+This README records only the headline progression:
 
 ``` text
-Baseline
-→ best self-trained
-→ key failed experiment
-→ best final
-→ skills / principles extracted
+Baseline (R01 LightGBM)
+-> best self-trained (R09 10-model + pseudo + stacking, LB 0.97785)
+-> key failed experiment (R12 iterative pseudo-labeling hurt performance)
+-> best externally-assisted (R17 Schema8 + formula prediction, LB 0.98150)
+-> reusable skills crystallized for the Cultivating ML Agent
 ```
 
 ------------------------------------------------------------------------
