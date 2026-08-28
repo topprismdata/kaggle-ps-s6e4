@@ -2,6 +2,7 @@
   <img src="https://raw.githubusercontent.com/topprismdata/.github/main/assets/brand/topprism-repo-header.png" alt="TopPrism dual-prism visual" width="100%" />
 </p>
 
+> Project planning notes: [`docs/PLAN.md`](docs/PLAN.md).
 # Kaggle PS S6E4 --- Capability Formation Case
 
 > **Language / 语言:** English primary · 中文概览如下。
