@@ -1,0 +1,7 @@
+cff-version: 1.2.0
+message: "If you use this software or research, please cite this repository."
+type: software
+title: "Kaggle PS S6E4 — Capability Formation Case"
+authors:
+  - name: "TopPrism Data"
+repository-code: https://github.com/topprismdata/kaggle-ps-s6e4
