@@ -4,6 +4,12 @@
 
 # Kaggle PS S6E4 --- Capability Formation Case
 
+> **Language / 语言:** English primary · 中文概览如下。
+>
+> ### 中文概览
+> 用于训练和评测 Cultivating ML Agent 的公开分类基准项目，记录实验、失败分析和能力沉淀。
+
+
 **A public classification benchmark used to train and evaluate
 TopPrism's Cultivating ML Agent.**
 
